@@ -4,8 +4,8 @@ import java.io.*;
 import java.net.Socket;
 import java.util.Scanner;
 
-public class Client1 {
-    public static void main(String[] args) throws IOException {
+public class Client {
+    public static void main(String[] args) {
         Scanner sc = new Scanner(System.in);
         Socket s = null;
         PrintWriter pw;
@@ -51,7 +51,6 @@ class SenderThread extends Thread {
     }
     public void run() {
         try {
-            pw.flush();
             while (true) {
                 String str = sc.nextLine();
                 if (str.equals("EXIT")) {
@@ -81,6 +80,11 @@ class ReceiverThread extends Thread {
         try {
             while (true) {
                 String msg = bfr.readLine();
+                if (msg == null) {
+                    s.close();
+                    System.out.println("[Notice] Connection failure. Server closed.");
+                    System.exit(0);
+                }
                 System.out.println(msg);
             }
         } catch (IOException e) {

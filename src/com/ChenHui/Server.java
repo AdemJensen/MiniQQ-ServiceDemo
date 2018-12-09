@@ -3,10 +3,6 @@ package com.ChenHui;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 import java.util.Scanner;
 
 /*
@@ -17,8 +13,8 @@ import java.util.Scanner;
  * 输出信息完全不需要thread。
  */
 
-public class Main {
-    public static void main(String[] args) throws IOException {
+public class Server {
+    public static void main(String[] args) {
         ServerClientRequestReceiverThread clientRequestReceiver = new ServerClientRequestReceiverThread();
 
         clientRequestReceiver.start();
@@ -27,6 +23,7 @@ public class Main {
         while (true) {
             if (sc.next().equals("EXIT")) {
                 System.out.println("[INSTANCE] The server has stopped.");
+                MasterDataStorage.masterSystemRunning = false;
                 System.exit(0);
             }
         }
@@ -34,6 +31,7 @@ public class Main {
 }
 
 class MasterDataStorage {
+    public static boolean masterSystemRunning = true;
     static class StorageElement {
         public boolean enabled;
         public BufferedReader iStream;
@@ -42,7 +40,7 @@ class MasterDataStorage {
         public StorageElement() {
             this.enabled = false;
         }
-        public StorageElement(Socket socket, BufferedReader iStream, PrintWriter oStream) throws IOException {
+        public StorageElement(Socket socket, BufferedReader iStream, PrintWriter oStream) {
             this.enabled = true;
             //将stream转换成BufferedReader，能够使外部操作更加方便
             this.iStream = iStream;
@@ -53,7 +51,7 @@ class MasterDataStorage {
     }
     public static int length = ClientDatabase.length;
     private static StorageElement[] contents = new StorageElement[length];
-    public static void set(int serial, Socket socket, BufferedReader iStream, PrintWriter oStream) throws IOException {
+    public static void set(int serial, Socket socket, BufferedReader iStream, PrintWriter oStream) {
         contents[serial] = new StorageElement(socket, iStream, oStream);
     }
     public static BufferedReader getBufferedReader(int serial) {
@@ -70,10 +68,10 @@ class MasterDataStorage {
 class ServerClientRequestReceiverThread extends Thread {    //副线程，用于接受客户端的连接请求
     @Override
     public void run() {
-        ServerSocket serverSocket = null;// 创建服务器Socket对象
+        ServerSocket serverSocket;// 创建服务器Socket对象
         try {
             serverSocket = new ServerSocket(9999);// 监听客户端的连接
-            while (true) {
+            while (MasterDataStorage.masterSystemRunning) {
                 Socket clientSocket = serverSocket.accept(); // 阻塞
                 ClientValidationThread validator = new ClientValidationThread(clientSocket);
                 validator.start();
@@ -98,6 +96,7 @@ class ClientValidationThread extends Thread {
         try {
             System.out.println("[NOTICE] A client is attempting to validate.");
             BufferedReader checker = new BufferedReader(new InputStreamReader(target.getInputStream()));
+            PrintWriter writer = new PrintWriter(new OutputStreamWriter(target.getOutputStream()));
             this.status = "waiting";
             String username = checker.readLine();
             String password = checker.readLine();
@@ -106,15 +105,30 @@ class ClientValidationThread extends Thread {
                 int gotUser = ClientDatabase.validateUser(username, password);
                 if (gotUser > -1 && !ClientDatabase.isOnline(gotUser)) {
                     synchronized (MasterDataStorage.class) {
-                        PrintWriter writer = new PrintWriter(new OutputStreamWriter(target.getOutputStream()));
                         MasterDataStorage.set(gotUser, target, checker, writer);
                         writer.println("success");
                         writer.flush();
                         (new ClientSenderThread(gotUser)).start();
+                        ClientDatabase.bringOnline(gotUser);
                         System.out.printf("[NOTICE] A client has logged online (%d)\n", gotUser);
                     }
+                    int count = 0;
+                    writer.print("[ROOM] Online users:");
+                    for (int i = 0; i < ClientDatabase.length; i++) {
+                        if (ClientDatabase.isOnline(i)) {
+                            count++;
+                            if (i == gotUser) continue;
+                            writer.print(" {" + ClientDatabase.getName(i) + "}");
+                            synchronized (MasterDataStorage.class) {
+                                PrintWriter Overwrite = MasterDataStorage.getPrintWriter(i);
+                                Overwrite.printf("[ROOM] *%s* has logged on.\n", ClientDatabase.getName(gotUser));
+                                Overwrite.flush();
+                            }
+                        }
+                    }
+                    writer.printf("\n[ROOM] There are %d users in this room.\n", count);
+                    writer.flush();
                 } else {
-                    PrintWriter writer = new PrintWriter(new OutputStreamWriter(target.getOutputStream()));
                     writer.println("fail");
                     writer.flush();
                     System.out.println("[NOTICE] Client validation has failed.");
@@ -159,12 +173,14 @@ class ClientSenderThread extends Thread {   //客户线程，用于处理与客�
     private int serial;
     private Socket client;
     private BufferedReader iStream;
+    private PrintWriter oStream;
 
     public ClientSenderThread(int serial) {
         synchronized (MasterDataStorage.class) {
             this.serial = serial;
             this.client = MasterDataStorage.getSocket(serial);
             this.iStream = MasterDataStorage.getBufferedReader(serial);
+            this.oStream = MasterDataStorage.getPrintWriter(serial);
         }
     }
     @Override
@@ -172,21 +188,76 @@ class ClientSenderThread extends Thread {   //客户线程，用于处理与客�
         while (true) {
             try {
                 String msg = iStream.readLine();
-                synchronized (ClientDatabase.class) {
-                    if (!ClientDatabase.isOnline(serial)) {
-                        System.out.print("ABNORMAL\n");
+                if (msg == null) {
+                    synchronized (ClientDatabase.class) {
+                        ClientDatabase.bringOffline(serial);
+                        System.out.printf("[Notice] A client has logged off (%d)\n", serial);
+                        for (int i = 0; i < ClientDatabase.length; i++) {
+                            if (ClientDatabase.isOnline(i)) {
+                                if (i == serial) continue;
+                                synchronized (MasterDataStorage.class) {
+                                    PrintWriter Overwrite = MasterDataStorage.getPrintWriter(i);
+                                    Overwrite.printf("[ROOM] *%s* has gone offline.\n", ClientDatabase.getName(serial));
+                                    Overwrite.flush();
+                                }
+                            }
+                        }
                         client.close();
-                        super.interrupt();
+                        break;
+                    }
+                }
+                String sendTarget = "PUBLIC";
+                msg = msg.trim();
+                String[] temp = new String[0];
+                String privateMsg = "";
+                if (msg.length() > 3 && msg.charAt(0) == '{' && msg.charAt(1) == '{' && msg.indexOf("}}") > 0) {
+                    temp = msg.split("}}", 2);
+                    if (temp.length == 2) {
+                        sendTarget = "PRIVATE";
+                        privateMsg = temp[1].trim();
                     }
                 }
                 synchronized (ClientDatabase.class) {
                     System.out.printf("[CLIENT(%s)-%d] %s\n",ClientDatabase.getName(serial), serial, msg);
-                    for (int i = 0; i < ClientDatabase.length; i++) {
-                        if (i == serial || !ClientDatabase.isOnline(i)) continue;
-                        synchronized (MasterDataStorage.class) {
-                            PrintWriter writer = MasterDataStorage.getPrintWriter(i);
-                            writer.printf("[%s] %s\n", ClientDatabase.getName(serial), msg);
-                            writer.flush();
+                    if (sendTarget.equals("PRIVATE")) {
+                        temp = temp[0].split(">", 2);
+                        if (temp.length < 2) {
+                            oStream.print("[SILENT] Silent info format invalid!\n");
+                            oStream.flush();
+                            continue;
+                        }
+                        sendTarget = temp[1].trim();
+                        boolean successful = false;
+                        for (int i = 0; i < ClientDatabase.length; i++) {
+                            if (ClientDatabase.getName(i).equals(sendTarget)) {
+                                if (!ClientDatabase.isOnline(i)) {
+                                    oStream.printf("[SILENT] *%s* is offline now!\n", sendTarget);
+                                    oStream.flush();
+                                } else {
+                                    synchronized (MasterDataStorage.class) {
+                                        PrintWriter writer = MasterDataStorage.getPrintWriter(i);
+                                        writer.printf("[%s --> YOU] %s\n", ClientDatabase.getName(serial), privateMsg);
+                                        writer.flush();
+                                    }
+                                    oStream.printf("[SILENT] Message successfully sent to %s.\n", sendTarget);
+                                    oStream.flush();
+                                }
+                                successful = true;
+                                break;
+                            }
+                        }
+                        if (!successful) {
+                            oStream.printf("[SILENT] There is no user called *%s*\n", sendTarget);
+                            oStream.flush();
+                        }
+                    } else {
+                        for (int i = 0; i < ClientDatabase.length; i++) {
+                            if (i == serial || !ClientDatabase.isOnline(i)) continue;
+                            synchronized (MasterDataStorage.class) {
+                                PrintWriter writer = MasterDataStorage.getPrintWriter(i);
+                                writer.printf("[%s] %s\n", ClientDatabase.getName(serial), msg);
+                                writer.flush();
+                            }
                         }
                     }
                 }
@@ -242,6 +313,9 @@ class ClientDatabase {  //用户数据库，用于验证用户登陆
         return accounts[serial].name;
     }
     public static void bringOffline(int serial) {
+        accounts[serial].bringOffline();
+    }
+    public static void bringOnline(int serial) {
         accounts[serial].bringOnline();
     }
     public static boolean isOnline(int serial) {
